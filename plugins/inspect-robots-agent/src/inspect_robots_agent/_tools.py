@@ -131,6 +131,10 @@ class Toolset:
                 "step count. Unnamed dimensions do not move. " + self._bounds_text
             )
             values_key = "deltas"
+        move_description += (
+            " Requires a short human-readable note explaining the current observation "
+            "and why this motion was chosen."
+        )
         move = {
             "type": "function",
             "function": {
@@ -146,8 +150,15 @@ class Toolset:
                                 + ", ".join(self._labels)
                             ),
                         },
+                        "note": {
+                            "type": "string",
+                            "description": (
+                                "Required short human-readable note explaining the "
+                                "current observation and why this motion was chosen."
+                            ),
+                        },
                     },
-                    "required": [values_key],
+                    "required": [values_key, "note"],
                 },
             },
         }
@@ -223,6 +234,14 @@ class Toolset:
                 raise ValueError("proprioceptive reference contains a non-finite value")
 
         values_key = "targets" if self._absolute else "deltas"
+        note = arguments.get("note")
+        if not isinstance(note, str) or not note.strip():
+            return ToolResult(
+                error=(
+                    "note must be a non-empty string explaining the current "
+                    "observation and why this motion was chosen"
+                )
+            )
         values = arguments.get(values_key)
         if not isinstance(values, dict) or not values:
             return ToolResult(error=f"{values_key} must be a non-empty object of name: value")
