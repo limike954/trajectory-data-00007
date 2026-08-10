@@ -1,0 +1,337 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Lint + strict typing, once, on a single interpreter. (mypy targets the 3.10
+  # floor via pyproject; running it on 3.11 avoids NumPy's 3.12-only stub syntax.)
+  quality:
+    name: lint · type
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs full history/tags for versioning
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install from uv.lock (dev + docs extras)
+        run: uv sync --locked --python 3.11 --extra dev --extra docs
+      - name: Ruff (lint)
+        run: uv run ruff check .
+      - name: Ruff (format check)
+        run: uv run ruff format --check .
+      - name: Mypy (strict)
+        run: uv run mypy
+      # Gated here because docs.yml's build job is in a different workflow and
+      # can't join ci-ok's needs list: a dead link that fails the strict docs
+      # build must not be mergeable.
+      - name: Docs build (strict)
+        run: uv run mkdocs build --strict
+
+  # Blocking test gate across the supported OS x Python matrix.
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install from uv.lock (dev extras)
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev
+      - name: Pytest
+        run: uv run pytest --cov --cov-report=term-missing
+
+  # RerunSink is otherwise only exercised against a fake `rerun` module
+  # (test_coverage_completion.py) so an SDK API change wouldn't be caught here.
+  # Install the real, uncapped rerun-sdk>=0.20 floor and run the tests that are
+  # skipped everywhere else so real incompatibilities surface in CI.
+  test-rerun:
+    name: test (rerun extra)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install from uv.lock (dev + rerun extras)
+        run: uv sync --locked --python 3.12 --extra dev --extra rerun
+      - name: Pytest (rerun-sdk installed)
+        run: uv run pytest tests/test_rerun_sink.py -v
+
+  # Non-blocking: extra Python versions, Windows, and the NumPy floor.
+  test-extra:
+    name: extra (${{ matrix.os }}, py${{ matrix.python-version }}, ${{ matrix.numpy }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+            numpy: "numpy>=1.24,<2"
+          - os: ubuntu-latest
+            python-version: "3.13"
+            numpy: "numpy>=2"
+          - os: windows-latest
+            python-version: "3.12"
+            numpy: "numpy>=2"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install from uv.lock (dev extras), then pin NumPy
+        run: |
+          uv sync --locked --python ${{ matrix.python-version }} --extra dev
+          uv pip install "${{ matrix.numpy }}"
+      - name: Pytest
+        run: uv run --no-sync pytest -q
+
+  core-only-import:
+    # Enforce the dependency boundary: the core package must import with ONLY
+    # numpy installed — no rerun, no torch, no optional extras.
+    name: core-only import (no rerun/torch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install core only from uv.lock (no extras)
+        run: uv sync --locked --python 3.12
+      - name: Assert optional deps are absent, then import
+        run: |
+          uv run python - <<'PY'
+          import importlib.util
+          for mod in ("rerun", "torch"):
+              assert importlib.util.find_spec(mod) is None, f"{mod} unexpectedly installed"
+          import inspect_robots
+          print("inspect_robots", inspect_robots.__version__, "imported with core deps only")
+          PY
+
+  # First-party plugins under plugins/* are their own packages with their own
+  # tests and coverage scope (NOT part of the core 100% gate). The Isaac adapter's
+  # suite runs WITHOUT Isaac installed: it covers spaces/semantics, protocol
+  # conformance, registry discovery, compatibility, memory-safety, and the
+  # clear-error path when Isaac is absent.
+  plugin-isaacsim:
+    name: plugin · isaacsim (no Isaac)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Sync workspace (core + plugins, dev extras)
+        run: uv sync --locked --python 3.11 --all-packages --extra dev
+      - name: Ruff (plugin, lint)
+        run: uv run --no-sync ruff check plugins/inspect-robots-isaacsim
+      - name: Ruff (plugin, format check)
+        run: uv run --no-sync ruff format --check plugins/inspect-robots-isaacsim
+      - name: Mypy (plugin, strict)
+        run: >
+          uv run --no-sync mypy
+          --config-file plugins/inspect-robots-isaacsim/pyproject.toml
+          plugins/inspect-robots-isaacsim/src/inspect_robots_isaacsim
+      - name: Pytest (plugin, with coverage)
+        # Report-only: unlike the core, the plugin has no 100% gate (its
+        # reset()/step() paths need real Isaac Lab, which CI doesn't have) — but
+        # the number should still be visible instead of unmeasured.
+        # --cov-fail-under=0 overrides the root pyproject's fail_under=100,
+        # which coverage.py would otherwise inherit since this runs from the
+        # repo root (the plugin's own pyproject sets no coverage config).
+        run: >
+          uv run --no-sync python -m pytest plugins/inspect-robots-isaacsim/tests -q
+          --cov=inspect_robots_isaacsim --cov-report=term-missing --cov-fail-under=0
+
+  # The XPolicyLab adapter's suite needs no XPolicyLab checkout: an in-process
+  # stub server speaks the real wire protocol, covering codec/client behavior,
+  # observation/action mapping, lifecycle, registry discovery, and compatibility.
+  plugin-xpolicylab:
+    name: plugin · xpolicylab
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Sync workspace (core + plugins, dev extras)
+        run: uv sync --locked --python 3.11 --all-packages --extra dev
+      - name: Ruff (plugin, lint)
+        run: uv run --no-sync ruff check plugins/inspect-robots-xpolicylab
+      - name: Ruff (plugin, format check)
+        run: uv run --no-sync ruff format --check plugins/inspect-robots-xpolicylab
+      - name: Mypy (plugin, strict)
+        run: >
+          uv run --no-sync mypy
+          --config-file plugins/inspect-robots-xpolicylab/pyproject.toml
+          plugins/inspect-robots-xpolicylab/src/inspect_robots_xpolicylab
+      - name: Pytest (plugin, with coverage)
+        # Report-only, same rationale as plugin-isaacsim: no 100% gate for
+        # plugins, but the number should be visible. --cov-fail-under=0
+        # overrides the root pyproject's fail_under=100.
+        run: >
+          uv run --no-sync python -m pytest plugins/inspect-robots-xpolicylab/tests -q
+          --cov=inspect_robots_xpolicylab --cov-report=term-missing --cov-fail-under=0
+
+  # The ROS adapter's suite needs no ROS install or robot: an in-process
+  # rosbridge stub covers protocol shapes, threading, pacing, reset, and spaces.
+  plugin-ros:
+    name: plugin · ros
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Sync workspace (core + plugins, dev extras)
+        run: uv sync --locked --python 3.11 --all-packages --extra dev
+      - name: Ruff (plugin, lint)
+        run: uv run --no-sync ruff check plugins/inspect-robots-ros
+      - name: Ruff (plugin, format check)
+        run: uv run --no-sync ruff format --check plugins/inspect-robots-ros
+      - name: Mypy (plugin, strict)
+        run: >
+          uv run --no-sync mypy
+          --config-file plugins/inspect-robots-ros/pyproject.toml
+          plugins/inspect-robots-ros/src/inspect_robots_ros
+      - name: Pytest (plugin, with coverage)
+        # Report-only, same rationale as the other first-party plugins.
+        # --cov-fail-under=0 overrides the root 100% core coverage gate.
+        run: >
+          uv run --no-sync python -m pytest plugins/inspect-robots-ros/tests -q
+          --cov=inspect_robots_ros --cov-report=term-missing --cov-fail-under=0
+
+  # The agent plugin's suite needs no LLM: httpx.MockTransport scripts the
+  # OpenAI-compatible conversations, and the mock cubepick world stands in for
+  # hardware — provider resolution, tool/motion synthesis, and the full
+  # eval() loop are covered offline.
+  plugin-agent:
+    name: plugin · agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Sync workspace (core + plugins, dev extras)
+        run: uv sync --locked --python 3.11 --all-packages --extra dev
+      - name: Ruff (plugin, lint)
+        run: uv run --no-sync ruff check plugins/inspect-robots-agent
+      - name: Ruff (plugin, format check)
+        run: uv run --no-sync ruff format --check plugins/inspect-robots-agent
+      - name: Mypy (plugin, strict)
+        run: >
+          uv run --no-sync mypy
+          --config-file plugins/inspect-robots-agent/pyproject.toml
+          plugins/inspect-robots-agent/src/inspect_robots_agent
+      - name: Pytest (plugin, with coverage)
+        # Report-only, same rationale as plugin-isaacsim: no 100% gate for
+        # plugins, but the number should be visible. --cov-fail-under=0
+        # overrides the root pyproject's fail_under=100.
+        run: >
+          uv run --no-sync python -m pytest plugins/inspect-robots-agent/tests -q
+          --cov=inspect_robots_agent --cov-report=term-missing --cov-fail-under=0
+
+  # Single required status check for branch protection: green iff every job
+  # above is green. Add new jobs to 'needs' here or they won't gate merges.
+  ci-ok:
+    name: ci-ok
+    if: ${{ always() }}
+    needs: [quality, test, test-rerun, test-extra, core-only-import, plugin-isaacsim, plugin-xpolicylab, plugin-ros, plugin-agent]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every needed job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+
+  # Red main is a stop-the-line event: open an issue so it can't go unnoticed.
+  # Only fires on pushes (i.e. merges to main), never on PR runs.
+  alert-red-main:
+    name: alert on red main
+    if: ${{ failure() && github.event_name == 'push' }}
+    needs: [quality, test, test-rerun, test-extra, core-only-import, plugin-isaacsim, plugin-xpolicylab, plugin-ros, plugin-agent]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue unless one is already open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "CI is red on main in:title" --json number --jq length)
+          if [ "$existing" = "0" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY"               --title "CI is red on main (${GITHUB_SHA:0:8})"               --body "CI failed on a push to main: $RUN_URL — stop-the-line: fix forward or revert before merging anything else. If the failure is transient (network, external deps), re-run the failed jobs and close this."
+          else
+            echo "an open red-main issue already exists; not filing another"
+          fi
